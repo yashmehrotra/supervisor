@@ -28,6 +28,12 @@ import getpass
 import socket
 import sys
 import threading
+import time
+import datetime
+
+import crayons
+import psutil
+from tabulate import tabulate
 
 from supervisor.compat import xmlrpclib
 from supervisor.compat import urlparse
@@ -56,6 +62,47 @@ class LSBInitExitStatuses:
 class LSBStatusExitStatuses:
     NOT_RUNNING = 3
     UNKNOWN = 4
+
+def get_color_fn(state):
+    COLOR_FN_MAP = {
+        'STOPPED': crayons.white,
+        'STARTING': crayons.yellow,
+        'RUNNING': crayons.green,
+        'BACKOFF': crayons.yellow,
+        'STOPPING': crayons.yellow,
+        'EXITED': crayons.red,
+        'FATAL': crayons.red,
+        'UNKNOWN': crayons.blue,
+    }
+    return COLOR_FN_MAP.get(state, crayons.white)
+
+def get_memory_usage(pid):
+    def hbytes(num):
+        for x in ['bytes','KB','MB','GB']:
+            if num < 1024.0:
+                return "%3.1f%s" % (num, x)
+            num /= 1024.0
+        return "%3.1f%s" % (num, 'TB')
+
+    try:
+        current_process = psutil.Process(pid)
+        used_mem_perc = current_process.memory_percent()
+        for child in current_process.children(recursive=True):
+            used_mem_perc+= child.memory_percent()
+
+        total_mem = psutil.virtual_memory().total
+        used_mem = used_mem_perc * total_mem
+        return hbytes(used_mem)
+    except:
+        return ''
+
+def get_cpu_usage_perc(pid):
+    try:
+        current_process = psutil.Process(pid)
+        return current_process.cpu_percent()/float(psutil.cpu_count())
+    except:
+        return ''
+
 
 DEAD_PROGRAM_FAULTS = (xmlrpc.Faults.SPAWN_ERROR,
                        xmlrpc.Faults.ABNORMAL_TERMINATION,
@@ -627,19 +674,37 @@ class DefaultControllerPlugin(ControllerPluginBase):
     def help_exit(self):
         self.ctl.output("exit\tExit the supervisor shell.")
 
-    def _show_statuses(self, process_infos):
-        namespecs, maxlen = [], 30
-        for i, info in enumerate(process_infos):
-            namespecs.append(make_namespec(info['group'], info['name']))
-            if len(namespecs[i]) > maxlen:
-                maxlen = len(namespecs[i])
 
-        template = '%(namespec)-' + str(maxlen+3) + 's%(state)-10s%(desc)s'
-        for i, info in enumerate(process_infos):
-            line = template % {'namespec': namespecs[i],
-                               'state': info['statename'],
-                               'desc': info['description']}
-            self.ctl.output(line)
+    def _get_uptime(self, start, now):
+
+        def _total_seconds(timedelta):
+            return ((timedelta.days * 86400 + timedelta.seconds) * 10**6 +
+                        timedelta.microseconds) / 10**6
+
+        start_dt = datetime.datetime(*time.gmtime(start)[:6])
+        now_dt = datetime.datetime(*time.gmtime(now)[:6])
+        uptime = now_dt - start_dt
+        if _total_seconds(uptime) < 0: # system time set back
+            uptime = datetime.timedelta(0)
+
+        return uptime
+
+    def _show_statuses(self, process_infos):
+        headers = ['name', 'status', 'pid', 'uptime', 'cpu', 'memory']
+
+        table = []
+        for info in process_infos:
+            name = make_namespec(info['group'], info['name'])
+            state, pid = info['statename'], info['pid']
+            color_fn = get_color_fn(state)
+            uptime = self._get_uptime(info['start'], info['now'])
+            cpu = get_cpu_usage_perc(pid)
+            memory = get_memory_usage(pid)
+
+            row = map(lambda x:color_fn(x, bold=True),
+                      (name, state, pid, uptime, cpu, memory))
+            table.append(row)
+        self.ctl.output(tabulate(table, headers, tablefmt='fancy_grid'))
 
     def do_status(self, arg):
         # XXX In case upcheck fails, we override the exitstatus which
